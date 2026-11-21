@@ -1,0 +1,6 @@
+{
+  "name": "Ping Forge",
+  "description": "AD BLOCKER | PING FORGE — Device-wide DNS-based ad, tracker, and threat protection paired with Ping Forge DNS benchmarking and resolver optimization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
