@@ -188,7 +188,7 @@ class PingForgeEngine(
         preferDoH: Boolean,
         transportLabel: String
     ): BenchmarkResult {
-        val useDoH = preferDoH && resolver.supportsDoH && !resolver.dohUrl.isNullOrBlank()
+        val dohUrl = resolver.dohUrl?.takeIf { preferDoH && resolver.supportsDoH && it.isNotBlank() }
         val latencies = mutableListOf<Long>()
         var primarySuccess = 0
         var primaryFailures = 0
@@ -196,8 +196,7 @@ class PingForgeEngine(
         var secondaryFailures = 0
         var lastError: String? = null
 
-        if (useDoH) {
-            val dohUrl = resolver.dohUrl!!
+        if (dohUrl != null) {
             // Strictly benchmark DoH only — never silently fall back to UDP and report it as DoH
             for (domain in probeDomains) {
                 val txId = txIdGenerator.incrementAndGet() and 0xFFFF
@@ -265,8 +264,8 @@ class PingForgeEngine(
         val min = sortedLat.firstOrNull()?.toDouble()
         val max = sortedLat.lastOrNull()?.toDouble()
 
-        val addressLabel = if (useDoH) {
-            val host = resolver.dohUrl?.removePrefix("https://")?.substringBefore('/') ?: resolver.primaryIp
+        val addressLabel = if (dohUrl != null) {
+            val host = dohUrl.removePrefix("https://").substringBefore('/')
             "DoH • $host"
         } else if (resolver.secondaryIp.isNotBlank() && resolver.secondaryIp != resolver.primaryIp) {
             "UDP • ${resolver.primaryIp} / ${resolver.secondaryIp}"
