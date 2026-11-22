@@ -122,15 +122,6 @@ class MainActivity : ComponentActivity() {
 fun PingForgeRoot(viewModel: MainViewModel) {
     val context = LocalContext.current
     val settings by viewModel.settings.collectAsStateWithLifecycle()
-    val vpnState by viewModel.vpnState.collectAsStateWithLifecycle()
-    val networkStatus by viewModel.networkStatus.collectAsStateWithLifecycle()
-    val activeResolver by viewModel.activeResolver.collectAsStateWithLifecycle()
-    val counters by viewModel.counters.collectAsStateWithLifecycle()
-    val blocklistStatus by viewModel.blocklistStatus.collectAsStateWithLifecycle()
-    val recentLogs by viewModel.recentLogs.collectAsStateWithLifecycle()
-    val benchmarkResults by viewModel.benchmarkResults.collectAsStateWithLifecycle()
-    val benchmarkProgress by viewModel.benchmarkProgress.collectAsStateWithLifecycle()
-    val domainTestResult by viewModel.domainTestResult.collectAsStateWithLifecycle()
     val showIntroSplash by viewModel.showIntroSplash.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
@@ -171,15 +162,19 @@ fun PingForgeRoot(viewModel: MainViewModel) {
         val navBackStackEntry by navController.currentBackStackEntryAsState()
         val currentRoute = navBackStackEntry?.destination?.route ?: Routes.ROUTE_HOME
 
-        val navigateToTab: (String) -> Unit = { route ->
-            navController.navigate(route) {
-                popUpTo(navController.graph.findStartDestination().id) {
-                    saveState = true
+        val navigateToTab: (String) -> Unit = remember(navController) {
+            { route ->
+                navController.navigate(route) {
+                    popUpTo(navController.graph.findStartDestination().id) {
+                        saveState = true
+                    }
+                    launchSingleTop = true
+                    restoreState = true
                 }
-                launchSingleTop = true
-                restoreState = true
             }
         }
+        val onNavigateToProtection = remember(navigateToTab) { { navigateToTab(Routes.ROUTE_PROTECTION) } }
+        val onNavigateToGaming = remember(navigateToTab) { { navigateToTab(Routes.ROUTE_GAMING) } }
 
         Box(modifier = Modifier.fillMaxSize()) {
             ForgeAtmosphereBackground(
@@ -277,6 +272,11 @@ fun PingForgeRoot(viewModel: MainViewModel) {
                                 modifier = Modifier.weight(1f)
                             ) {
                                 composable(Routes.ROUTE_HOME) {
+                                    val vpnState by viewModel.vpnState.collectAsStateWithLifecycle()
+                                    val networkStatus by viewModel.networkStatus.collectAsStateWithLifecycle()
+                                    val activeResolver by viewModel.activeResolver.collectAsStateWithLifecycle()
+                                    val counters by viewModel.counters.collectAsStateWithLifecycle()
+                                    val blocklistStatus by viewModel.blocklistStatus.collectAsStateWithLifecycle()
                                     HomeScreen(
                                         vpnState = vpnState,
                                         settings = settings,
@@ -286,12 +286,17 @@ fun PingForgeRoot(viewModel: MainViewModel) {
                                         blocklistStatus = blocklistStatus,
                                         onToggleConnect = viewModel::toggleVpnConnection,
                                         onSelectMode = viewModel::setOperatingMode,
-                                        onNavigateToProtection = { navigateToTab(Routes.ROUTE_PROTECTION) },
-                                        onNavigateToGaming = { navigateToTab(Routes.ROUTE_GAMING) }
+                                        onNavigateToProtection = onNavigateToProtection,
+                                        onNavigateToGaming = onNavigateToGaming
                                     )
                                 }
 
                                 composable(Routes.ROUTE_PROTECTION) {
+                                    val vpnState by viewModel.vpnState.collectAsStateWithLifecycle()
+                                    val blocklistStatus by viewModel.blocklistStatus.collectAsStateWithLifecycle()
+                                    val counters by viewModel.counters.collectAsStateWithLifecycle()
+                                    val recentLogs by viewModel.recentLogs.collectAsStateWithLifecycle()
+                                    val domainTestResult by viewModel.domainTestResult.collectAsStateWithLifecycle()
                                     ProtectionScreen(
                                         vpnState = vpnState,
                                         settings = settings,
@@ -310,6 +315,10 @@ fun PingForgeRoot(viewModel: MainViewModel) {
                                 }
 
                                 composable(Routes.ROUTE_GAMING) {
+                                    val networkStatus by viewModel.networkStatus.collectAsStateWithLifecycle()
+                                    val activeResolver by viewModel.activeResolver.collectAsStateWithLifecycle()
+                                    val benchmarkResults by viewModel.benchmarkResults.collectAsStateWithLifecycle()
+                                    val benchmarkProgress by viewModel.benchmarkProgress.collectAsStateWithLifecycle()
                                     GamingScreen(
                                         settings = settings,
                                         networkStatus = networkStatus,
@@ -325,6 +334,9 @@ fun PingForgeRoot(viewModel: MainViewModel) {
                                 }
 
                                 composable(Routes.ROUTE_SETTINGS) {
+                                    val activeResolver by viewModel.activeResolver.collectAsStateWithLifecycle()
+                                    val counters by viewModel.counters.collectAsStateWithLifecycle()
+                                    val blocklistStatus by viewModel.blocklistStatus.collectAsStateWithLifecycle()
                                     SettingsScreen(
                                         settings = settings,
                                         activeResolver = activeResolver,
