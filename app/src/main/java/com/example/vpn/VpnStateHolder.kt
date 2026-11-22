@@ -22,14 +22,19 @@ import com.example.engine.filter.DomainFilterEngine
 import com.example.engine.pingforge.PingForgeEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -59,6 +64,8 @@ class AppContainer(val appContext: Context) {
         private set
 
     private val lastToggleActionMillis = AtomicLong(0L)
+    private val autoUpdateSchedulerInitialized = AtomicBoolean(false)
+    private var autoUpdateJob: Job? = null
 
     init {
         // Initialize blocklists on IO thread
@@ -66,7 +73,7 @@ class AppContainer(val appContext: Context) {
             blocklistRepository.initializeListsIfNeeded()
         }
 
-        // Keep filter engine & DNS cache synchronized with DataStore changes without dropping VPN
+        // Keep filter engine, DNS cache, and automatic blocklist scheduler synchronized with DataStore
         settingsRepository.settingsFlow
             .distinctUntilChanged()
             .onEach { settings ->
@@ -84,6 +91,14 @@ class AppContainer(val appContext: Context) {
                     dnsCache.clear()
                 }
 
+                val firstInit = autoUpdateSchedulerInitialized.compareAndSet(false, true)
+                if (firstInit ||
+                    previous.autoUpdateBlocklists != settings.autoUpdateBlocklists ||
+                    previous.updateIntervalHours != settings.updateIntervalHours
+                ) {
+                    rescheduleAutoBlocklistUpdates(settings)
+                }
+
                 val activeResolver = SettingsRepository.resolveActiveResolver(settings)
                 _vpnState.value = _vpnState.value.copy(
                     activeResolverName = activeResolver.name,
@@ -95,9 +110,52 @@ class AppContainer(val appContext: Context) {
         // Monitor network changes & auto-rebenchmark Ping Forge on Wi-Fi <-> Cellular transitions
         networkMonitor.startMonitoring { transport, isConnected ->
             dnsCache.clear()
-            if (isConnected && latestSettings.rebenchmarkOnNetworkChange && !pingForgeEngine.progress.value.isRunning) {
-                scope.launch {
-                    pingForgeEngine.runFullBenchmark(transport, isNetworkConnected = true)
+            if (isConnected) {
+                if (latestSettings.rebenchmarkOnNetworkChange && !pingForgeEngine.progress.value.isRunning) {
+                    scope.launch {
+                        pingForgeEngine.runFullBenchmark(transport, isNetworkConnected = true)
+                    }
+                }
+                if (latestSettings.autoUpdateBlocklists) {
+                    scope.launch {
+                        val lastUpdated = settingsRepository.lastBlocklistUpdateFlow.first()
+                        if (BlocklistRepository.isAutoUpdateDue(lastUpdated, latestSettings.updateIntervalHours)) {
+                            rescheduleAutoBlocklistUpdates(latestSettings)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun rescheduleAutoBlocklistUpdates(settings: AppSettings) {
+        autoUpdateJob?.cancel()
+        autoUpdateJob = null
+        if (!settings.autoUpdateBlocklists) return
+
+        autoUpdateJob = scope.launch {
+            // Brief startup grace delay so bundled lists finish loading first
+            delay(10_000L)
+            while (isActive && latestSettings.autoUpdateBlocklists) {
+                val lastUpdated = settingsRepository.lastBlocklistUpdateFlow.first()
+                val delayMs = BlocklistRepository.computeNextUpdateDelayMillis(
+                    lastUpdatedMillis = lastUpdated,
+                    intervalHours = latestSettings.updateIntervalHours
+                )
+                if (delayMs > 0L) {
+                    delay(delayMs)
+                }
+                if (!isActive || !latestSettings.autoUpdateBlocklists) break
+
+                val net = networkMonitor.refreshNow()
+                if (!net.isConnected) {
+                    delay(AUTO_UPDATE_RETRY_DELAY_MS)
+                    continue
+                }
+
+                val result = blocklistRepository.updateBlocklistsFromNetwork()
+                if (result.isFailure) {
+                    delay(AUTO_UPDATE_RETRY_DELAY_MS)
                 }
             }
         }
@@ -174,6 +232,13 @@ class AppContainer(val appContext: Context) {
     fun getActiveResolver(): DnsResolver = SettingsRepository.resolveActiveResolver(latestSettings)
 
     fun getFallbackResolvers(primary: DnsResolver): List<DnsResolver> {
-        return BuiltInResolvers.defaultResolvers.filter { it.id != primary.id }
+        return pingForgeEngine.getRankedFallbackResolvers(
+            primary = primary,
+            availableResolvers = BuiltInResolvers.defaultResolvers
+        )
+    }
+
+    companion object {
+        private const val AUTO_UPDATE_RETRY_DELAY_MS = 15 * 60_000L
     }
 }

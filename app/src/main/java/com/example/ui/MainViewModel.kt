@@ -217,7 +217,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 } else {
                     _events.tryEmit(
-                        UiEvent.ShowMessage("Benchmark finished with resolver timeouts.", isError = true)
+                        UiEvent.ShowMessage(
+                            "No DNS resolver met the ${com.example.engine.pingforge.PingForgeEngine.MIN_RELIABLE_PERCENT}% reliability threshold.",
+                            isError = true
+                        )
                     )
                 }
             }.onFailure { err ->
@@ -252,15 +255,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val cleanSecondary = secondary.trim()
         val cleanDoh = dohUrl.trim()
 
-        if (!isValidIpv4(cleanPrimary)) {
+        if (!isValidIpAddress(cleanPrimary)) {
             _events.tryEmit(
-                UiEvent.ShowMessage("Enter a valid primary IPv4 DNS address (e.g., 1.1.1.1).", isError = true)
+                UiEvent.ShowMessage("Enter a valid primary IPv4 or IPv6 DNS address (e.g., 1.1.1.1 or 2606:4700:4700::1111).", isError = true)
             )
             return false
         }
-        if (cleanSecondary.isNotEmpty() && !isValidIpv4(cleanSecondary)) {
+        if (cleanSecondary.isNotEmpty() && !isValidIpAddress(cleanSecondary)) {
             _events.tryEmit(
-                UiEvent.ShowMessage("Secondary DNS must be a valid IPv4 address or left blank.", isError = true)
+                UiEvent.ShowMessage("Secondary DNS must be a valid IPv4/IPv6 address or left blank.", isError = true)
             )
             return false
         }
@@ -391,5 +394,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 num in 0..255
             }
         }
+
+        fun isValidIpv6(ip: String): Boolean {
+            val trimmed = ip.trim()
+            if (trimmed.isEmpty() || !trimmed.contains(':') || trimmed.length > 45) return false
+            if (trimmed.contains(":::")) return false
+            val doubleColonParts = trimmed.split("::")
+            if (doubleColonParts.size > 2) return false
+
+            val left = if (doubleColonParts[0].isEmpty()) emptyList() else doubleColonParts[0].split(':')
+            val right = if (doubleColonParts.size == 2 && doubleColonParts[1].isNotEmpty()) {
+                doubleColonParts[1].split(':')
+            } else {
+                emptyList()
+            }
+
+            val allGroups = left + right
+            val totalGroups = allGroups.size
+            if (doubleColonParts.size == 1 && totalGroups != 8) return false
+            if (doubleColonParts.size == 2 && totalGroups >= 8) return false
+
+            return allGroups.all { group ->
+                group.length in 1..4 && group.all { ch ->
+                    ch in '0'..'9' || ch in 'a'..'f' || ch in 'A'..'F'
+                }
+            }
+        }
+
+        fun isValidIpAddress(ip: String): Boolean = isValidIpv4(ip) || isValidIpv6(ip)
     }
 }

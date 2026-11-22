@@ -264,7 +264,15 @@ class SettingsRepository(private val context: Context) {
 
     companion object {
         fun resolveActiveResolver(settings: AppSettings): DnsResolver {
-            if (settings.selectedResolverId == BuiltInResolvers.CUSTOM_RESOLVER_ID &&
+            val targetId = if (settings.selectedResolverId == BuiltInResolvers.AUTOMATIC_RESOLVER_ID ||
+                settings.autoSelectFastestResolver
+            ) {
+                settings.resolvedAutomaticId
+            } else {
+                settings.selectedResolverId
+            }
+
+            if (targetId == BuiltInResolvers.CUSTOM_RESOLVER_ID &&
                 settings.customDnsPrimary.isNotBlank()
             ) {
                 return DnsResolver(
@@ -279,13 +287,7 @@ class SettingsRepository(private val context: Context) {
                     isCustom = true
                 )
             }
-            val targetId = if (settings.selectedResolverId == BuiltInResolvers.AUTOMATIC_RESOLVER_ID ||
-                settings.autoSelectFastestResolver
-            ) {
-                settings.resolvedAutomaticId
-            } else {
-                settings.selectedResolverId
-            }
+
             return BuiltInResolvers.defaultResolvers.firstOrNull { it.id == targetId }
                 ?: BuiltInResolvers.defaultResolvers.first()
         }

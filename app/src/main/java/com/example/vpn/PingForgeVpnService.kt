@@ -20,23 +20,24 @@ import com.example.domain.model.VpnErrorType
 import com.example.domain.model.VpnStatus
 import com.example.engine.dns.DnsPacket
 import com.example.engine.dns.Ipv4UdpPacketParser
+import com.example.engine.dns.TcpDnsSessionManager
 import com.example.engine.filter.FilterDecision
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 
 /**
- * Local split-DNS VpnService.
- * Routes only our virtual DNS endpoint (10.111.222.1/32) into the TUN interface so:
+ * Local split-DNS VpnService supporting IPv4 & IPv6 DNS over UDP and TCP (port 53).
+ * Routes only our virtual DNS endpoints (10.111.222.1/32 and fd00:111:222::1/128) into TUN so:
  * - All device-wide DNS queries are filtered and resolved with Ping Forge's selected upstream DNS.
  * - Normal app/game TCP & UDP packets bypass the VPN tunnel directly over Wi-Fi/Mobile with zero overhead.
  */
@@ -50,13 +51,46 @@ class PingForgeVpnService : VpnService() {
 
         private const val VPN_ADDRESS = "10.111.222.2"
         private const val VIRTUAL_DNS_SERVER = "10.111.222.1"
+        private const val VPN_ADDRESS_V6 = "fd00:111:222::2"
+        private const val VIRTUAL_DNS_SERVER_V6 = "fd00:111:222::1"
+
+        private const val WORKER_COUNT = 16
+        private const val REQUEST_QUEUE_CAPACITY = 64
+        private const val TELEMETRY_QUEUE_CAPACITY = 256
+        private const val MAX_UDP_DNS_PAYLOAD_V4 = 1472
+        private const val MAX_UDP_DNS_PAYLOAD_V6 = 1452
     }
+
+    private sealed class InboundDnsRequest {
+        abstract val dnsPayload: ByteArray
+
+        data class Udp(val packet: Ipv4UdpPacketParser.UdpDnsPacket) : InboundDnsRequest() {
+            override val dnsPayload: ByteArray get() = packet.dnsPayload
+        }
+
+        data class Tcp(
+            val sessionKey: TcpDnsSessionManager.SessionKey,
+            override val dnsPayload: ByteArray
+        ) : InboundDnsRequest()
+    }
+
+    private data class TelemetryEvent(
+        val totalDelta: Long = 1L,
+        val blockedDelta: Long = 0L,
+        val cachedDelta: Long = 0L,
+        val failedDelta: Long = 0L,
+        val queryRecord: DnsQueryRecord? = null
+    )
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var vpnInterface: ParcelFileDescriptor? = null
     private var packetLoopJob: Job? = null
+    private val workerJobs = mutableListOf<Job>()
+    private var telemetryJob: Job? = null
+    private var requestChannel: Channel<InboundDnsRequest>? = null
+    private var telemetryChannel: Channel<TelemetryEvent>? = null
+    private val tcpSessionManager = TcpDnsSessionManager()
     private val writeLock = Any()
-    private val queryConcurrencyLimiter = Semaphore(24)
 
     private val appContainer: AppContainer
         get() = (application as PingForgeApplication).container
@@ -142,6 +176,14 @@ class PingForgeVpnService : VpnService() {
                 .setMtu(1500)
                 .setBlocking(true)
 
+            // Route virtual IPv6 DNS server through TUN as well when supported by the device kernel
+            runCatching {
+                builder
+                    .addAddress(VPN_ADDRESS_V6, 128)
+                    .addDnsServer(VIRTUAL_DNS_SERVER_V6)
+                    .addRoute(VIRTUAL_DNS_SERVER_V6, 128)
+            }
+
             // Prevent our own DoH & blocklist update requests from entering TUN
             runCatching { builder.addDisallowedApplication(packageName) }
 
@@ -185,11 +227,72 @@ class PingForgeVpnService : VpnService() {
         }
     }
 
-    private fun startPacketLoop(pfd: ParcelFileDescriptor) {
+    private fun stopWorkersAndChannels() {
         packetLoopJob?.cancel()
+        packetLoopJob = null
+
+        requestChannel?.close()
+        requestChannel = null
+
+        workerJobs.forEach { it.cancel() }
+        workerJobs.clear()
+
+        telemetryChannel?.close()
+        telemetryChannel = null
+
+        telemetryJob?.cancel()
+        telemetryJob = null
+
+        tcpSessionManager.clear()
+    }
+
+    private fun startPacketLoop(pfd: ParcelFileDescriptor) {
+        stopWorkersAndChannels()
+
+        val output = FileOutputStream(pfd.fileDescriptor)
+        val reqChannel = Channel<InboundDnsRequest>(
+            capacity = REQUEST_QUEUE_CAPACITY,
+            onBufferOverflow = BufferOverflow.SUSPEND
+        )
+        val telChannel = Channel<TelemetryEvent>(
+            capacity = TELEMETRY_QUEUE_CAPACITY,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+        requestChannel = reqChannel
+        telemetryChannel = telChannel
+
+        // Dedicated non-blocking telemetry writer so DataStore/Room I/O never stalls DNS workers
+        telemetryJob = serviceScope.launch {
+            for (event in telChannel) {
+                runCatching {
+                    appContainer.settingsRepository.incrementCounters(
+                        totalDelta = event.totalDelta,
+                        blockedDelta = event.blockedDelta,
+                        cachedDelta = event.cachedDelta,
+                        failedDelta = event.failedDelta
+                    )
+                    if (event.queryRecord != null) {
+                        appContainer.telemetryRepository.recordQuery(event.queryRecord)
+                    }
+                }
+            }
+        }
+
+        // Fixed-size worker pool prevents unbounded coroutine accumulation under heavy DNS traffic
+        repeat(WORKER_COUNT) {
+            workerJobs.add(
+                serviceScope.launch {
+                    for (request in reqChannel) {
+                        runCatching {
+                            handleInboundRequest(request, output)
+                        }
+                    }
+                }
+            )
+        }
+
         packetLoopJob = serviceScope.launch {
             val input = FileInputStream(pfd.fileDescriptor)
-            val output = FileOutputStream(pfd.fileDescriptor)
             val buffer = ByteArray(32767)
 
             while (isActive) {
@@ -204,158 +307,246 @@ class PingForgeVpnService : VpnService() {
                 if (length <= 0) continue
 
                 val packetCopy = buffer.copyOf(length)
-                val udpPacket = Ipv4UdpPacketParser.parseUdpDnsPacket(packetCopy, length) ?: continue
-                val question = DnsPacket.parseQuestion(udpPacket.dnsPayload) ?: continue
 
-                launch {
-                    queryConcurrencyLimiter.withPermit {
-                        handleDnsQuestion(udpPacket, question, output)
+                val udpPacket = Ipv4UdpPacketParser.parseUdpDnsPacket(packetCopy, length)
+                if (udpPacket != null) {
+                    // Non-blocking enqueue: drops safely under extreme flood instead of spawning coroutines
+                    reqChannel.trySend(InboundDnsRequest.Udp(udpPacket))
+                    continue
+                }
+
+                val tcpSegment = Ipv4UdpPacketParser.parseTcpDnsSegment(packetCopy, length)
+                if (tcpSegment != null) {
+                    val result = tcpSessionManager.handleIncomingSegment(tcpSegment)
+                    for (ctrlPacket in result.immediatePackets) {
+                        writeRawTunPacket(ctrlPacket, output)
+                    }
+                    for ((sessionKey, dnsQuery) in result.completedDnsQueries) {
+                        reqChannel.trySend(InboundDnsRequest.Tcp(sessionKey, dnsQuery))
                     }
                 }
             }
         }
     }
 
-    private suspend fun handleDnsQuestion(
-        udpPacket: Ipv4UdpPacketParser.UdpDnsPacket,
-        question: DnsPacket.DnsQuestion,
+    private suspend fun handleInboundRequest(
+        request: InboundDnsRequest,
         output: FileOutputStream
     ) {
+        val message = DnsPacket.parseAllQuestions(request.dnsPayload) ?: return
         val startNs = System.nanoTime()
         val settings = appContainer.latestSettings
         val resolver = appContainer.getActiveResolver()
-        val decision = appContainer.filterEngine.evaluate(question.qName)
 
-        when (decision) {
-            is FilterDecision.Blocked -> {
-                val blockedDns = DnsPacket.buildBlockedResponse(udpPacket.dnsPayload, question)
-                writeTunResponse(udpPacket, blockedDns, output)
-                val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+        // Evaluate EVERY question in the DNS packet so multi-question queries cannot bypass filtering
+        var blockedDecision: FilterDecision.Blocked? = null
+        var invalidDecision: FilterDecision.InvalidDomain? = null
+        var anyAllowlisted = false
+        var primaryNormalizedDomain = message.questions.first().qName
 
-                appContainer.settingsRepository.incrementCounters(totalDelta = 1L, blockedDelta = 1L)
-                if (settings.showQueryLogs) {
-                    appContainer.telemetryRepository.recordQuery(
+        for ((index, q) in message.questions.withIndex()) {
+            when (val decision = appContainer.filterEngine.evaluate(q.qName)) {
+                is FilterDecision.Blocked -> {
+                    blockedDecision = decision
+                    break
+                }
+                is FilterDecision.InvalidDomain -> {
+                    if (invalidDecision == null) invalidDecision = decision
+                }
+                is FilterDecision.Allowlisted -> {
+                    anyAllowlisted = true
+                    if (index == 0) primaryNormalizedDomain = decision.normalizedDomain
+                }
+                is FilterDecision.Allowed -> {
+                    if (index == 0) primaryNormalizedDomain = decision.normalizedDomain
+                }
+            }
+        }
+
+        if (blockedDecision != null) {
+            val blockedDns = DnsPacket.buildBlockedResponse(request.dnsPayload, message)
+            sendDnsResponse(request, message, blockedDns, output)
+            val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+            enqueueTelemetry(
+                TelemetryEvent(
+                    totalDelta = 1L,
+                    blockedDelta = 1L,
+                    queryRecord = if (settings.showQueryLogs) {
                         DnsQueryRecord(
-                            domain = decision.normalizedDomain,
-                            category = decision.category,
-                            isCustomRule = decision.isCustomRule,
+                            domain = blockedDecision.normalizedDomain,
+                            category = blockedDecision.category,
+                            isCustomRule = blockedDecision.isCustomRule,
                             action = QueryAction.BLOCKED,
                             latencyMs = elapsedMs,
                             resolverName = "Local Shield"
                         )
-                    )
-                }
-                return
-            }
-
-            is FilterDecision.InvalidDomain -> {
-                val servFail = DnsPacket.buildServFailResponse(udpPacket.dnsPayload, question)
-                writeTunResponse(udpPacket, servFail, output)
-                appContainer.settingsRepository.incrementCounters(totalDelta = 1L, failedDelta = 1L)
-                return
-            }
-
-            is FilterDecision.Allowlisted, is FilterDecision.Allowed -> {
-                val normalizedDomain = when (decision) {
-                    is FilterDecision.Allowlisted -> decision.normalizedDomain
-                    is FilterDecision.Allowed -> decision.normalizedDomain
-                    else -> question.qName
-                }
-                val isAllowlisted = decision is FilterDecision.Allowlisted
-
-                // Check DNS Cache first if enabled
-                if (settings.enableDnsCache) {
-                    val cached = appContainer.dnsCache.get(normalizedDomain, question.qType, resolver.id)
-                    if (cached != null) {
-                        val rewritten = DnsPacket.rewriteTransactionId(cached, question.transactionId)
-                        writeTunResponse(udpPacket, rewritten, output)
-                        val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
-                        appContainer.settingsRepository.incrementCounters(totalDelta = 1L, cachedDelta = 1L)
-                        if (settings.showQueryLogs) {
-                            appContainer.telemetryRepository.recordQuery(
-                                DnsQueryRecord(
-                                    domain = normalizedDomain,
-                                    action = if (isAllowlisted) QueryAction.ALLOWLISTED else QueryAction.CACHED,
-                                    latencyMs = elapsedMs,
-                                    resolverName = "${resolver.name} (Cache)"
-                                )
-                            )
-                        }
-                        return
-                    }
-                }
-
-                // Forward to upstream resolver with automatic fallback
-                val forwardResult = appContainer.upstreamDnsClient.forwardQuery(
-                    queryPacket = udpPacket.dnsPayload,
-                    primaryResolver = resolver,
-                    fallbackResolvers = appContainer.getFallbackResolvers(resolver),
-                    preferDoH = settings.preferDoH,
-                    timeoutMs = 2500
+                    } else null
                 )
+            )
+            return
+        }
 
-                if (forwardResult != null) {
-                    val responseWithTx = DnsPacket.rewriteTransactionId(
-                        forwardResult.responseBytes,
-                        question.transactionId
+        if (invalidDecision != null) {
+            val servFail = DnsPacket.buildServFailResponse(request.dnsPayload, message)
+            sendDnsResponse(request, message, servFail, output)
+            enqueueTelemetry(TelemetryEvent(totalDelta = 1L, failedDelta = 1L))
+            return
+        }
+
+        val singleQuestion = message.questions.singleOrNull()
+        val activeTransport = if (settings.preferDoH && resolver.supportsDoH && !resolver.dohUrl.isNullOrBlank()) {
+            "doh"
+        } else {
+            "udp"
+        }
+        val cacheResolverKey = "${resolver.id}:$activeTransport:${resolver.primaryIp}"
+
+        // Check DNS Cache first if enabled (single-question queries only)
+        if (settings.enableDnsCache && singleQuestion != null) {
+            val cachedHit = appContainer.dnsCache.getWithMetadata(
+                domain = primaryNormalizedDomain,
+                qType = singleQuestion.qType,
+                qClass = singleQuestion.qClass,
+                resolverKey = cacheResolverKey
+            )
+            if (cachedHit != null) {
+                val rewritten = DnsPacket.rewriteResponseForCache(
+                    responsePacket = cachedHit.responseBytes,
+                    newTxId = message.transactionId,
+                    elapsedSeconds = cachedHit.elapsedSeconds
+                )
+                sendDnsResponse(request, message, rewritten, output)
+                val elapsedMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                enqueueTelemetry(
+                    TelemetryEvent(
+                        totalDelta = 1L,
+                        cachedDelta = 1L,
+                        queryRecord = if (settings.showQueryLogs) {
+                            DnsQueryRecord(
+                                domain = primaryNormalizedDomain,
+                                action = if (anyAllowlisted) QueryAction.ALLOWLISTED else QueryAction.CACHED,
+                                latencyMs = elapsedMs,
+                                resolverName = "${resolver.name} (Cache)"
+                            )
+                        } else null
                     )
-                    writeTunResponse(udpPacket, responseWithTx, output)
+                )
+                return
+            }
+        }
 
-                    if (settings.enableDnsCache) {
-                        val ttl = DnsPacket.extractMinTtlSeconds(forwardResult.responseBytes)
-                        appContainer.dnsCache.put(
-                            domain = normalizedDomain,
-                            qType = question.qType,
-                            resolverId = resolver.id,
-                            responseBytes = forwardResult.responseBytes,
-                            ttlSeconds = ttl,
-                            maxConfiguredTtlSeconds = settings.cacheTtlSeconds
-                        )
-                    }
+        // Forward to upstream resolver with automatic fallback (force TCP if client queried over TCP)
+        val forwardResult = appContainer.upstreamDnsClient.forwardQuery(
+            queryPacket = request.dnsPayload,
+            primaryResolver = resolver,
+            fallbackResolvers = appContainer.getFallbackResolvers(resolver),
+            preferDoH = settings.preferDoH,
+            timeoutMs = 2500,
+            forceTcp = request is InboundDnsRequest.Tcp
+        )
 
-                    appContainer.settingsRepository.incrementCounters(totalDelta = 1L)
-                    if (settings.showQueryLogs) {
-                        appContainer.telemetryRepository.recordQuery(
-                            DnsQueryRecord(
-                                domain = normalizedDomain,
-                                action = if (isAllowlisted) QueryAction.ALLOWLISTED else QueryAction.ALLOWED,
-                                latencyMs = forwardResult.latencyMs,
-                                resolverName = if (forwardResult.usedFallback) {
-                                    "${forwardResult.usedResolverName} (Fallback)"
-                                } else {
-                                    forwardResult.usedResolverName
-                                }
-                            )
+        if (forwardResult != null) {
+            val responseWithTx = DnsPacket.rewriteTransactionId(
+                forwardResult.responseBytes,
+                message.transactionId
+            )
+            sendDnsResponse(request, message, responseWithTx, output)
+
+            if (settings.enableDnsCache &&
+                singleQuestion != null &&
+                !forwardResult.usedFallback &&
+                DnsPacket.isCacheableResponse(forwardResult.responseBytes)
+            ) {
+                val ttl = DnsPacket.extractMinTtlSeconds(forwardResult.responseBytes)
+                if (ttl > 0) {
+                    appContainer.dnsCache.put(
+                        domain = primaryNormalizedDomain,
+                        qType = singleQuestion.qType,
+                        resolverId = cacheResolverKey,
+                        responseBytes = forwardResult.responseBytes,
+                        ttlSeconds = ttl,
+                        maxConfiguredTtlSeconds = settings.cacheTtlSeconds,
+                        qClass = singleQuestion.qClass
+                    )
+                }
+            }
+
+            enqueueTelemetry(
+                TelemetryEvent(
+                    totalDelta = 1L,
+                    queryRecord = if (settings.showQueryLogs) {
+                        DnsQueryRecord(
+                            domain = primaryNormalizedDomain,
+                            action = if (anyAllowlisted) QueryAction.ALLOWLISTED else QueryAction.ALLOWED,
+                            latencyMs = forwardResult.latencyMs,
+                            resolverName = if (forwardResult.usedFallback) {
+                                "${forwardResult.usedResolverName} (Fallback)"
+                            } else {
+                                forwardResult.usedResolverName
+                            }
                         )
-                    }
+                    } else null
+                )
+            )
+        } else {
+            val servFail = DnsPacket.buildServFailResponse(request.dnsPayload, message)
+            sendDnsResponse(request, message, servFail, output)
+            enqueueTelemetry(
+                TelemetryEvent(
+                    totalDelta = 1L,
+                    failedDelta = 1L,
+                    queryRecord = if (settings.showQueryLogs) {
+                        DnsQueryRecord(
+                            domain = primaryNormalizedDomain,
+                            action = QueryAction.FAILED,
+                            latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L),
+                            resolverName = resolver.name
+                        )
+                    } else null
+                )
+            )
+        }
+    }
+
+    private fun enqueueTelemetry(event: TelemetryEvent) {
+        telemetryChannel?.trySend(event)
+    }
+
+    private fun sendDnsResponse(
+        request: InboundDnsRequest,
+        message: DnsPacket.DnsMessageQuestions,
+        dnsResponsePayload: ByteArray,
+        output: FileOutputStream
+    ) {
+        when (request) {
+            is InboundDnsRequest.Udp -> {
+                val maxUdpPayload = if (request.packet.ipVersion == 6) {
+                    MAX_UDP_DNS_PAYLOAD_V6
                 } else {
-                    val servFail = DnsPacket.buildServFailResponse(udpPacket.dnsPayload, question)
-                    writeTunResponse(udpPacket, servFail, output)
-                    appContainer.settingsRepository.incrementCounters(totalDelta = 1L, failedDelta = 1L)
-                    if (settings.showQueryLogs) {
-                        appContainer.telemetryRepository.recordQuery(
-                            DnsQueryRecord(
-                                domain = normalizedDomain,
-                                action = QueryAction.FAILED,
-                                latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L),
-                                resolverName = resolver.name
-                            )
-                        )
-                    }
+                    MAX_UDP_DNS_PAYLOAD_V4
+                }
+                val safePayload = if (dnsResponsePayload.size > maxUdpPayload) {
+                    DnsPacket.buildTruncatedResponse(request.dnsPayload, message)
+                } else {
+                    dnsResponsePayload
+                }
+                val rawResponse = Ipv4UdpPacketParser.buildUdpResponsePacket(request.packet, safePayload)
+                writeRawTunPacket(rawResponse, output)
+            }
+
+            is InboundDnsRequest.Tcp -> {
+                val segments = tcpSessionManager.buildDnsResponseSegments(request.sessionKey, dnsResponsePayload)
+                for (segment in segments) {
+                    writeRawTunPacket(segment, output)
                 }
             }
         }
     }
 
-    private fun writeTunResponse(
-        udpPacket: Ipv4UdpPacketParser.UdpDnsPacket,
-        dnsResponsePayload: ByteArray,
-        output: FileOutputStream
-    ) {
-        val rawResponse = Ipv4UdpPacketParser.buildUdpResponsePacket(udpPacket, dnsResponsePayload)
+    private fun writeRawTunPacket(rawPacket: ByteArray, output: FileOutputStream) {
         synchronized(writeLock) {
             runCatching {
-                output.write(rawResponse)
+                output.write(rawPacket)
             }
         }
     }
@@ -365,8 +556,7 @@ class PingForgeVpnService : VpnService() {
         errorType: VpnErrorType? = null,
         errorMessage: String? = null
     ) {
-        packetLoopJob?.cancel()
-        packetLoopJob = null
+        stopWorkersAndChannels()
 
         runCatching { vpnInterface?.close() }
         vpnInterface = null

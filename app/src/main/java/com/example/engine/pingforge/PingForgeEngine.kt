@@ -32,12 +32,24 @@ data class BenchmarkProgress(
 class PingForgeEngine(
     private val upstreamClient: UpstreamDnsClient,
     private val settingsRepository: SettingsRepository,
-    private val telemetryRepository: TelemetryRepository
+    private val telemetryRepository: TelemetryRepository,
+    private val dohProbe: (ByteArray, String) -> Pair<ByteArray, Long>? = { query, url ->
+        upstreamClient.queryDoH(query, url)
+    },
+    private val udpProbe: (ByteArray, String, Int) -> Pair<ByteArray, Long>? = { query, ip, timeoutMs ->
+        upstreamClient.queryUdp(query, ip, timeoutMs = timeoutMs)
+    }
 ) {
     private val _progress = MutableStateFlow(BenchmarkProgress())
     val progress: StateFlow<BenchmarkProgress> = _progress.asStateFlow()
 
     private val txIdGenerator = AtomicInteger(1000)
+
+    @Volatile
+    private var rankedResolverIds: List<String> = emptyList()
+
+    @Volatile
+    private var reliabilityByResolverId: Map<String, Int> = emptyMap()
 
     private val probeDomains = listOf(
         "example.com",
@@ -45,6 +57,12 @@ class PingForgeEngine(
         "google.com",
         "wikipedia.org",
         "github.com"
+    )
+
+    private val secondaryProbeDomains = listOf(
+        "example.com",
+        "cloudflare.com",
+        "google.com"
     )
 
     suspend fun runFullBenchmark(
@@ -100,64 +118,142 @@ class PingForgeEngine(
             results.add(result)
         }
 
-        // Rank by reliability (>= 80% first), then by lowest median response ms
-        val sorted = results.sortedWith(
-            compareByDescending<BenchmarkResult> { it.reliabilityPercent >= 80 }
-                .thenByDescending { it.reliabilityPercent }
-                .thenBy { it.medianMs ?: Double.MAX_VALUE }
-        )
-
+        val sorted = rankResults(results)
+        recordBenchmarkRanking(sorted)
         telemetryRepository.saveBenchmarks(sorted)
 
-        // If automatic selection is active, apply fastest reliable built-in resolver
-        val bestReliable = sorted.firstOrNull { it.reliabilityPercent >= 60 && it.medianMs != null }
+        // Only auto-select a resolver that meets the strict reliability threshold (>= 80%)
+        val bestReliable = pickRecommended(sorted)
         if (bestReliable != null) {
             settingsRepository.setResolvedAutomaticId(bestReliable.resolverId)
+        }
+
+        val errorMsg = when {
+            sorted.all { it.successCount == 0 } -> "All DNS benchmark queries failed or timed out."
+            bestReliable == null -> "No DNS resolver met the $MIN_RELIABLE_PERCENT% reliability threshold."
+            else -> null
         }
 
         _progress.value = BenchmarkProgress(
             isRunning = false,
             completedResolvers = resolversToTest.size,
             totalResolvers = resolversToTest.size,
-            lastError = if (sorted.all { it.successCount == 0 }) {
-                "All DNS benchmark queries failed or timed out."
-            } else null
+            lastError = errorMsg
         )
 
         return@withContext Result.success(sorted)
     }
 
-    private fun benchmarkSingleResolver(
+    /**
+     * Returns fallback resolvers ordered by the latest measured benchmark performance
+     * (reliable fastest resolvers first, excluding dead 0%-reliable resolvers when better options exist).
+     */
+    fun getRankedFallbackResolvers(
+        primary: DnsResolver,
+        availableResolvers: List<DnsResolver> = BuiltInResolvers.defaultResolvers
+    ): List<DnsResolver> {
+        val candidates = availableResolvers.filter { it.id != primary.id }
+        val ranking = rankedResolverIds
+        if (ranking.isEmpty()) return candidates
+
+        val reliability = reliabilityByResolverId
+        val byId = candidates.associateBy { it.id }
+        val reliableRanked = mutableListOf<DnsResolver>()
+        val degradedRanked = mutableListOf<DnsResolver>()
+        val deadRanked = mutableListOf<DnsResolver>()
+
+        for (id in ranking) {
+            val resolver = byId[id] ?: continue
+            val rel = reliability[id] ?: 0
+            when {
+                rel >= MIN_RELIABLE_PERCENT -> reliableRanked.add(resolver)
+                rel > 0 -> degradedRanked.add(resolver)
+                else -> deadRanked.add(resolver)
+            }
+        }
+
+        val rankedSet = ranking.toSet()
+        val unbenchmarked = candidates.filter { it.id !in rankedSet }
+        val nonDead = reliableRanked + unbenchmarked + degradedRanked
+        return if (nonDead.isNotEmpty()) nonDead else (nonDead + deadRanked)
+    }
+
+    internal fun recordBenchmarkRanking(sortedResults: List<BenchmarkResult>) {
+        rankedResolverIds = sortedResults.map { it.resolverId }
+        reliabilityByResolverId = sortedResults.associate { it.resolverId to it.reliabilityPercent }
+    }
+
+    internal fun benchmarkSingleResolver(
         resolver: DnsResolver,
         preferDoH: Boolean,
         transportLabel: String
     ): BenchmarkResult {
+        val useDoH = preferDoH && resolver.supportsDoH && !resolver.dohUrl.isNullOrBlank()
         val latencies = mutableListOf<Long>()
-        var failures = 0
+        var primarySuccess = 0
+        var primaryFailures = 0
+        var secondarySuccess = 0
+        var secondaryFailures = 0
         var lastError: String? = null
 
-        for (domain in probeDomains) {
-            val txId = txIdGenerator.incrementAndGet() and 0xFFFF
-            val query = DnsPacket.buildQueryPacket(domain, txId, DnsPacket.TYPE_A)
-
-            val measurement = if (preferDoH && resolver.supportsDoH && !resolver.dohUrl.isNullOrBlank()) {
-                upstreamClient.queryDoH(query, resolver.dohUrl)
-                    ?: upstreamClient.queryUdp(query, resolver.primaryIp, timeoutMs = 2000)
-            } else {
-                upstreamClient.queryUdp(query, resolver.primaryIp, timeoutMs = 2000)
+        if (useDoH) {
+            val dohUrl = resolver.dohUrl!!
+            // Strictly benchmark DoH only — never silently fall back to UDP and report it as DoH
+            for (domain in probeDomains) {
+                val txId = txIdGenerator.incrementAndGet() and 0xFFFF
+                val query = DnsPacket.buildQueryPacket(domain, txId, DnsPacket.TYPE_A)
+                val measurement = dohProbe(query, dohUrl)
+                if (measurement != null) {
+                    latencies.add(measurement.second)
+                    primarySuccess++
+                } else {
+                    primaryFailures++
+                    lastError = "DoH query timeout / unreachable ($dohUrl)"
+                }
+            }
+        } else {
+            // Strictly benchmark UDP (with RFC 1035 TC->TCP handled inside queryUdp) across primary & secondary IPs
+            for (domain in probeDomains) {
+                val txId = txIdGenerator.incrementAndGet() and 0xFFFF
+                val query = DnsPacket.buildQueryPacket(domain, txId, DnsPacket.TYPE_A)
+                val measurement = udpProbe(query, resolver.primaryIp, 2000)
+                if (measurement != null) {
+                    latencies.add(measurement.second)
+                    primarySuccess++
+                } else {
+                    primaryFailures++
+                    lastError = "Primary UDP timeout / unreachable (${resolver.primaryIp})"
+                }
             }
 
-            if (measurement != null) {
-                latencies.add(measurement.second)
-            } else {
-                failures++
-                lastError = "Query timeout / unreachable (${resolver.primaryIp})"
+            val hasDistinctSecondary = resolver.secondaryIp.isNotBlank() &&
+                resolver.secondaryIp != resolver.primaryIp
+            if (hasDistinctSecondary) {
+                for (domain in secondaryProbeDomains) {
+                    val txId = txIdGenerator.incrementAndGet() and 0xFFFF
+                    val query = DnsPacket.buildQueryPacket(domain, txId, DnsPacket.TYPE_A)
+                    val measurement = udpProbe(query, resolver.secondaryIp, 2000)
+                    if (measurement != null) {
+                        latencies.add(measurement.second)
+                        secondarySuccess++
+                    } else {
+                        secondaryFailures++
+                        if (lastError == null) {
+                            lastError = "Secondary UDP timeout / unreachable (${resolver.secondaryIp})"
+                        }
+                    }
+                }
             }
         }
 
-        val total = probeDomains.size
-        val success = latencies.size
-        val reliability = ((success.toDouble() / total.toDouble()) * 100.0).toInt()
+        val total = primarySuccess + primaryFailures + secondarySuccess + secondaryFailures
+        val success = primarySuccess + secondarySuccess
+        val failures = primaryFailures + secondaryFailures
+        val reliability = if (total == 0 || primarySuccess == 0) {
+            0
+        } else {
+            ((success.toDouble() / total.toDouble()) * 100.0).toInt()
+        }
         val sortedLat = latencies.sorted()
 
         val median = if (sortedLat.isEmpty()) null else {
@@ -169,14 +265,19 @@ class PingForgeEngine(
         val min = sortedLat.firstOrNull()?.toDouble()
         val max = sortedLat.lastOrNull()?.toDouble()
 
+        val addressLabel = if (useDoH) {
+            val host = resolver.dohUrl?.removePrefix("https://")?.substringBefore('/') ?: resolver.primaryIp
+            "DoH • $host"
+        } else if (resolver.secondaryIp.isNotBlank() && resolver.secondaryIp != resolver.primaryIp) {
+            "UDP • ${resolver.primaryIp} / ${resolver.secondaryIp}"
+        } else {
+            "UDP • ${resolver.primaryIp}"
+        }
+
         return BenchmarkResult(
             resolverId = resolver.id,
             resolverName = resolver.name,
-            resolverAddress = if (preferDoH && resolver.supportsDoH) {
-                resolver.dohUrl?.removePrefix("https://")?.substringBefore('/') ?: resolver.primaryIp
-            } else {
-                resolver.primaryIp
-            },
+            resolverAddress = addressLabel,
             medianMs = median,
             avgMs = avg,
             minMs = min,
@@ -192,15 +293,32 @@ class PingForgeEngine(
     }
 
     companion object {
+        const val MIN_RELIABLE_PERCENT = 80
+
+        fun rankResults(results: List<BenchmarkResult>): List<BenchmarkResult> {
+            return results.sortedWith(
+                compareByDescending<BenchmarkResult> {
+                    it.reliabilityPercent >= MIN_RELIABLE_PERCENT && it.successCount > 0 && it.medianMs != null
+                }
+                    .thenBy {
+                        if (it.reliabilityPercent >= MIN_RELIABLE_PERCENT && it.medianMs != null) {
+                            it.medianMs
+                        } else {
+                            Double.MAX_VALUE
+                        }
+                    }
+                    .thenByDescending { it.reliabilityPercent }
+                    .thenBy { it.medianMs ?: Double.MAX_VALUE }
+            )
+        }
+
         fun pickRecommended(results: List<BenchmarkResult>): BenchmarkResult? {
-            return results
-                .filter { it.successCount > 0 && it.medianMs != null }
-                .sortedWith(
-                    compareByDescending<BenchmarkResult> { it.reliabilityPercent >= 80 }
-                        .thenByDescending { it.reliabilityPercent }
-                        .thenBy { it.medianMs ?: Double.MAX_VALUE }
-                )
-                .firstOrNull()
+            return rankResults(results)
+                .firstOrNull {
+                    it.reliabilityPercent >= MIN_RELIABLE_PERCENT &&
+                        it.successCount > 0 &&
+                        it.medianMs != null
+                }
         }
     }
 }
